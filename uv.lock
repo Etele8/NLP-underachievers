@@ -985,7 +985,6 @@ dependencies = [
     { name = "pyyaml" },
     { name = "scikit-learn" },
     { name = "seqeval" },
-    { name = "torch" },
     { name = "tqdm" },
     { name = "transformers" },
 ]
@@ -1001,7 +1000,6 @@ requires-dist = [
     { name = "pyyaml" },
     { name = "scikit-learn" },
     { name = "seqeval" },
-    { name = "torch" },
     { name = "tqdm" },
     { name = "transformers" },
 ]
