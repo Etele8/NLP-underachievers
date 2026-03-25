@@ -13,6 +13,17 @@ uv sync
 
 source .venv/bin/activate
 
-uv pip install --index-url https://download.pytorch.org/whl/cu126 torch
+cd ~/projects/NLP-underachievers
+source .venv/bin/activate
 
-python -c "import torch; print(torch.__version__)"
+uv pip install --python .venv/bin/python --index-url https://download.pytorch.org/whl/cu126 torch==2.10.0
+
+python - <<'EOF'
+import torch, sys
+print("python:", sys.executable)
+print("torch.__version__:", torch.__version__)
+print("torch.version.cuda:", torch.version.cuda)
+print("torch file:", torch.__file__)
+print("cuda available:", torch.cuda.is_available())
+print("device count:", torch.cuda.device_count())
+EOF
