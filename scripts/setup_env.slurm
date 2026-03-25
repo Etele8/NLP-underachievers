@@ -13,7 +13,7 @@ uv sync
 
 source .venv/bin/activate
 
-uv pip uninstall -y torch || true
+uv pip uninstall torch || true
 uv pip install --index-url https://download.pytorch.org/whl/cu126 torch
 
 python -c "import torch; print(torch.__version__)"
