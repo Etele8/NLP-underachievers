@@ -6,9 +6,14 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
 
-cd ~/projects/nlp-underachievers
+cd ~/projects/NLP-underachievers
 export PATH="$HOME/.local/bin:$PATH"
 
 uv sync
 
 source .venv/bin/activate
+
+uv pip uninstall -y torch torchvision torchaudio || true
+uv pip install --index-url https://download.pytorch.org/whl/cu126 torch torchvision torchaudio
+
+python -c "import torch; print(torch.__version__)"
