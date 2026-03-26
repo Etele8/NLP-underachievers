@@ -133,6 +133,7 @@ def main() -> None:
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=total_steps)
 
     start_epoch = 1
+    best_f1 = 0.0
 
     if args.resume:
         ckpt_path = None
@@ -151,7 +152,6 @@ def main() -> None:
             )
             start_epoch += 1
 
-    best_f1 = 0.0
     best_dir = output_dir / f"best_{make_safe_model_name(args.model_name)}"
 
     for epoch in range(start_epoch, args.epochs + 1):
