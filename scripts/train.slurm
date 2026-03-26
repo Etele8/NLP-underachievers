@@ -44,7 +44,7 @@ echo "===== TRAIN START ====="
   --train_file data-baseline/en_ewt-ud-train.iob2 \
   --dev_file data-baseline/en_ewt-ud-dev.iob2 \
   --output_dir "$OUT_DIR" \
-  --epochs 5 \
+  --epochs 3 \
   --batch_size 16 \
   --learning_rate 2e-5 \
   --max_length 128 \
