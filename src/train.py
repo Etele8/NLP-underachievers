@@ -12,7 +12,7 @@ from transformers import AutoModelForTokenClassification, AutoTokenizer, get_lin
 
 from data import build_label_vocab, parse_iob2_file
 from modeling import TokenClassificationDataset, align_labels_with_tokens, compute_seqeval_metrics, get_device
-from utils import ensure_dir, make_safe_model_name, save_check_point, load_checkpoint
+from utils import ensure_dir, make_safe_model_name, save_checkpoint, load_checkpoint
 
 
 
@@ -189,18 +189,18 @@ def main() -> None:
         dev_pred_path = output_dir / f"dev_predictions_{make_safe_model_name(args.model_name)}.iob2"
         save_dev_predictions(dev_examples, eval_results["predictions"], dev_pred_path)
 
-	if args.checkpoint_dir:
-            ckpt_dir = Path(args.checkpoint_dir)
-            ensure_dir(ckpt_dir)
+        if args.checkpoint_dir:
+                ckpt_dir = Path(args.checkpoint_dir)
+                ensure_dir(ckpt_dir)
 
-            save_checkpoint(
-                ckpt_dir / "last.pt",
-                model,
-                optimizer,
-                scheduler,
-                epoch,
-                best_f1,
-            )
+                save_checkpoint(
+                    ckpt_dir / "last.pt",
+                    model,
+                    optimizer,
+                    scheduler,
+                    epoch,
+                    best_f1,
+                )
 
     logging.info("Training finished. Best dev F1: %.4f", best_f1)
     logging.info("Best model dir: %s", best_dir)
