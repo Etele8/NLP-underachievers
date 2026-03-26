@@ -12,7 +12,8 @@ from transformers import AutoModelForTokenClassification, AutoTokenizer, get_lin
 
 from data import build_label_vocab, parse_iob2_file
 from modeling import TokenClassificationDataset, align_labels_with_tokens, compute_seqeval_metrics, get_device
-from utils import ensure_dir, make_safe_model_name
+from utils import ensure_dir, make_safe_model_name, save_check_point, load_checkpoint
+
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -87,6 +88,8 @@ def main() -> None:
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--max_length", type=int, default=128)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--checkpoint_dir", type=str, default=None)
+    parser.add_argument("--resume", type=str, default=None)
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -129,10 +132,29 @@ def main() -> None:
     total_steps = len(train_loader) * args.epochs
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=total_steps)
 
+    start_epoch = 1
+
+    if args.resume:
+        ckpt_path = None
+
+        if args.resume == "auto" and args.checkpoint_dir:
+            candidate = Path(args.checkpoint_dir) / "last.pt"
+            if candidate.exists():
+                ckpt_path = candidate
+        else:
+            ckpt_path = Path(args.resume)
+
+        if ckpt_path and ckpt_path.exists():
+            logging.info(f"Resuming from {ckpt_path}")
+            start_epoch, best_f1 = load_checkpoint(
+                ckpt_path, model, optimizer, scheduler
+            )
+            start_epoch += 1
+
     best_f1 = 0.0
     best_dir = output_dir / f"best_{make_safe_model_name(args.model_name)}"
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         running_loss = 0.0
 
@@ -166,6 +188,19 @@ def main() -> None:
 
         dev_pred_path = output_dir / f"dev_predictions_{make_safe_model_name(args.model_name)}.iob2"
         save_dev_predictions(dev_examples, eval_results["predictions"], dev_pred_path)
+
+	if args.checkpoint_dir:
+            ckpt_dir = Path(args.checkpoint_dir)
+            ensure_dir(ckpt_dir)
+
+            save_checkpoint(
+                ckpt_dir / "last.pt",
+                model,
+                optimizer,
+                scheduler,
+                epoch,
+                best_f1,
+            )
 
     logging.info("Training finished. Best dev F1: %.4f", best_f1)
     logging.info("Best model dir: %s", best_dir)

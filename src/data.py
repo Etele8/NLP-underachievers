@@ -37,10 +37,10 @@ def parse_iob2_file(path: Path) -> List[Dict[str, List[str]]]:
                 # support UD-style: idx token ... label
                 if parts[0].isdigit():
                     token = parts[1]
-                    label = parts[-1]
+                    label = parts[2]
                 else:
                     token = parts[0]
-                    label = parts[-1]
+                    label = parts[1]
 
             tokens.append(token)
             labels.append(label)
