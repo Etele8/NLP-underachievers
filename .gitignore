@@ -1,6 +1,10 @@
 # folders
 /data
 /data-baseline
+/checkpoints
+/logs
+
+# extensions
 *.json
 *.safetensors
 
