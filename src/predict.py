@@ -32,8 +32,11 @@ def reconstruct_test_output(line_items: List[Dict[str, Any]], pred_labels: List[
                     raise RuntimeError("Prediction count mismatch during reconstruction")
 
                 parts = item["parts"].copy()
-                if item["has_label"]:
-                    parts[-1] = pred_labels[idx]
+
+                if len(parts) >= 3 and parts[0].isdigit():
+                    parts[2] = pred_labels[idx]
+                elif len(parts) >= 2:
+                    parts[1] = pred_labels[idx]
                 else:
                     parts.append(pred_labels[idx])
 

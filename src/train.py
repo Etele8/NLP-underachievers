@@ -68,8 +68,8 @@ def save_dev_predictions(
 ) -> None:
     with output_file.open("w", encoding="utf-8") as f:
         for ex, pred in zip(sentences, predictions):
-            for token, label in zip(ex["tokens"], pred):
-                f.write(f"{token}\t{label}\n")
+            for idx, (token, label) in enumerate(zip(ex["tokens"], pred), start=1):
+                f.write(f"{idx}\t{token}\t{label}\n")
             f.write("\n")
 
 

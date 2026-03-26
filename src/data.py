@@ -34,7 +34,6 @@ def parse_iob2_file(path: Path) -> List[Dict[str, List[str]]]:
                 token = parts[0]
                 label = parts[1]
             else:
-                # support UD-style: idx token ... label
                 if parts[0].isdigit():
                     token = parts[1]
                     label = parts[2]
@@ -72,25 +71,13 @@ def parse_iob2_test_file(path: Path) -> Tuple[List[Dict[str, List[str]]], List[D
                 continue
 
             parts = re.split(r"\t|\s+", line.strip())
-            if len(parts) < 1:
-                # ignore empty, already handled
-                continue
 
             if len(parts) == 1:
                 token = parts[0]
-                has_label = False
-                orig_label = None
             elif len(parts) == 2:
                 token = parts[0]
-                has_label = True
-                orig_label = parts[1]
             else:
-                if parts[0].isdigit():
-                    token = parts[1]
-                else:
-                    token = parts[0]
-                has_label = len(parts) > 1
-                orig_label = parts[-1] if has_label else None
+                token = parts[1] if parts[0].isdigit() else parts[0]
 
             tokens.append(token)
             line_items.append(
@@ -98,8 +85,6 @@ def parse_iob2_test_file(path: Path) -> Tuple[List[Dict[str, List[str]]], List[D
                     "type": "token",
                     "parts": parts,
                     "token": token,
-                    "has_label": has_label,
-                    "orig_label": orig_label,
                 }
             )
 
