@@ -1,4 +1,5 @@
 from pathlib import Path
+import torch
 
 
 def make_safe_model_name(model_name: str) -> str:
