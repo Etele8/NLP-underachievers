@@ -306,3 +306,83 @@ The repository already contains sample output folders:
 - `outputs/test_run/`
 
 These are useful as references for expected prediction filenames and directory layout.
+
+## Real NER Pipeline
+
+The real Spanish-English code-switched tweet NER data lives in:
+
+- `data/raw/ner_spaeng_train.csv`
+- `data/raw/ner_spaeng_validation.csv`
+- `data/raw/ner_spaeng_test.csv`
+
+The new clean pipeline is implemented in:
+
+- `src/data.py`
+- `src/model_factory.py`
+- `src/train.py`
+- `src/predict.py`
+- `src/evaluate.py`
+- `src/utils.py`
+
+### Train mBERT
+
+```powershell
+uv run python -m src.train --config configs/mbert.yaml
+```
+
+### Train XLM-R
+
+```powershell
+uv run python -m src.train --config configs/xlmr.yaml
+```
+
+### Smoke Test
+
+```powershell
+uv run python -m src.train --config configs/mbert.yaml --smoke-test
+```
+
+You can also smoke-test XLM-R:
+
+```powershell
+uv run python -m src.train --config configs/xlmr.yaml --smoke-test
+```
+
+### Prediction
+
+```powershell
+uv run python -m src.predict --config configs/mbert.yaml --checkpoint outputs/real_ner/<run_dir>/best.pt --split test
+```
+
+If the selected split has usable gold labels, prediction also writes metrics and a classification report. The current `test` CSV appears to contain masked blank labels, so the pipeline saves predictions and skips seqeval metrics for that split.
+
+### SLURM Commands
+
+```bash
+sbatch scripts/train.slurm
+sbatch --export=CONFIG=configs/xlmr.yaml scripts/train.slurm
+sbatch --export=CONFIG=configs/mbert.yaml,CHECKPOINT=outputs/real_ner/<run_dir>/best.pt,SPLIT=test scripts/predict.slurm
+```
+
+### Output Files
+
+Each training run writes a timestamped directory under `outputs/real_ner/` containing:
+
+- `config.yaml`
+- `label_maps.json`
+- `metrics.jsonl`
+- `last.pt`
+- `best.pt`
+- `best_validation_metrics.json`
+- `validation_predictions_last.jsonl`
+- `validation_predictions_last.csv`
+- `validation_predictions_best.jsonl`
+- `validation_predictions_best.csv`
+- `run_summary.json`
+
+Prediction writes split-specific exports alongside the selected checkpoint:
+
+- `predictions_<split>.jsonl`
+- `predictions_<split>.csv`
+- `metrics_<split>.json`
+- `classification_report_<split>.txt` when gold labels exist

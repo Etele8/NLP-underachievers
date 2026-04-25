@@ -3,6 +3,8 @@
 /data-baseline
 /checkpoints
 /logs
+/legacy_baseline
+/outputs
 
 # extensions
 *.json
