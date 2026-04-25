@@ -1,209 +1,408 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any
 
 import torch
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
-from transformers import AutoModelForTokenClassification, AutoTokenizer, get_linear_schedule_with_warmup
+from tqdm.auto import tqdm
+from transformers import get_linear_schedule_with_warmup
 
-from data import build_label_vocab, parse_iob2_file
-from modeling import TokenClassificationDataset, align_labels_with_tokens, compute_seqeval_metrics, get_device
-from utils import ensure_dir, make_safe_model_name, save_checkpoint, load_checkpoint
-
+from .data import (
+    TokenizedNERDataset,
+    build_label_maps,
+    create_data_collator,
+    load_split_csv,
+    save_label_maps,
+    summarize_examples,
+)
+from .evaluate import compute_metrics, save_predictions_table
+from .model_factory import create_token_classifier, load_tokenizer
+from .utils import (
+    count_trainable_parameters,
+    ensure_dir,
+    get_device,
+    load_yaml_config,
+    save_checkpoint,
+    save_config_copy,
+    save_json,
+    set_seed,
+)
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+LOGGER = logging.getLogger(__name__)
 
 
-def evaluate(
-    model: AutoModelForTokenClassification,
-    dataloader: DataLoader,
-    id2label: Dict[int, str],
-    device: torch.device,
-) -> Dict[str, Any]:
-    model.eval()
-    all_preds = []
-    all_labels = []
+def _log_dataset_stats(split_name: str, examples: list[dict[str, Any]]) -> None:
+    stats = summarize_examples(examples)
+    LOGGER.info(
+        "%s stats: examples=%s labeled=%s mean_tokens=%.2f max_tokens=%s labels=%s entities=%s",
+        split_name,
+        stats["num_examples"],
+        stats["num_labeled_examples"],
+        stats["mean_tokens_per_example"],
+        stats["max_tokens_per_example"],
+        stats["label_distribution"],
+        stats["entity_type_counts"],
+    )
 
-    with torch.no_grad():
-        for batch in dataloader:
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            labels = batch["labels"].to(device)
 
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-            logits = outputs.logits
-            preds = torch.argmax(logits, dim=-1)
-
-            for pred_row, label_row in zip(preds.cpu().tolist(), labels.cpu().tolist()):
-                sent_pred = []
-                sent_label = []
-                for p, l in zip(pred_row, label_row):
-                    if l == -100:
-                        continue
-                    sent_pred.append(id2label[p])
-                    sent_label.append(id2label[l])
-                all_preds.append(sent_pred)
-                all_labels.append(sent_label)
-
-    metrics = compute_seqeval_metrics(all_preds, all_labels)
+def _move_batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
     return {
-        "precision": metrics["precision"],
-        "recall": metrics["recall"],
-        "f1": metrics["f1"],
-        "report": metrics["report"],
-        "predictions": all_preds,
-        "references": all_labels,
+        key: value.to(device) if isinstance(value, torch.Tensor) else value
+        for key, value in batch.items()
     }
 
 
-def save_dev_predictions(
-    sentences: List[Dict[str, Any]],
-    predictions: List[List[str]],
-    output_file: Path,
-) -> None:
-    with output_file.open("w", encoding="utf-8") as f:
-        for ex, pred in zip(sentences, predictions):
-            for idx, (token, label) in enumerate(zip(ex["tokens"], pred), start=1):
-                f.write(f"{idx}\t{token}\t{label}\n")
-            f.write("\n")
+def _extract_word_level_predictions(
+    logits: torch.Tensor,
+    batch: dict[str, Any],
+    id2label: dict[int, str],
+) -> list[dict[str, Any]]:
+    pred_ids = torch.argmax(logits.detach().cpu(), dim=-1).tolist()
+    rows: list[dict[str, Any]] = []
+
+    for example_index, row_pred_ids in enumerate(pred_ids):
+        word_ids = batch["word_ids"][example_index]
+        tokens = batch["tokens"][example_index]
+        gold_labels = batch["gold_labels"][example_index]
+        has_labels = batch["has_labels"][example_index]
+        seen_word_ids: list[int] = []
+        seen_word_id_set: set[int] = set()
+        row_predictions: list[str] = []
+
+        for pred_id, word_id in zip(row_pred_ids, word_ids):
+            if word_id is None or word_id in seen_word_id_set or word_id >= len(tokens):
+                continue
+            row_predictions.append(id2label[int(pred_id)])
+            seen_word_ids.append(word_id)
+            seen_word_id_set.add(word_id)
+
+        observed_tokens = [tokens[word_id] for word_id in seen_word_ids]
+        observed_golds = [gold_labels[word_id] for word_id in seen_word_ids] if has_labels else []
+        rows.append(
+            {
+                "id": batch["example_ids"][example_index],
+                "split": batch["splits"][example_index],
+                "tokens": observed_tokens,
+                "pred_labels": row_predictions,
+                "gold_labels": observed_golds,
+                "truncated": len(observed_tokens) < len(tokens),
+                "original_token_count": len(tokens),
+            }
+        )
+
+    return rows
+
+
+def evaluate(
+    model: torch.nn.Module,
+    dataloader: DataLoader,
+    device: torch.device,
+    id2label: dict[int, str],
+) -> tuple[float, dict[str, Any], list[dict[str, Any]]]:
+    model.eval()
+    losses: list[float] = []
+    prediction_rows: list[dict[str, Any]] = []
+
+    with torch.no_grad():
+        for batch in dataloader:
+            device_batch = _move_batch_to_device(batch, device)
+            has_supervision = bool((device_batch["labels"] != -100).any().item())
+            if has_supervision:
+                outputs = model(
+                    input_ids=device_batch["input_ids"],
+                    attention_mask=device_batch["attention_mask"],
+                    labels=device_batch["labels"],
+                )
+                losses.append(float(outputs.loss.detach().cpu().item()))
+            else:
+                outputs = model(
+                    input_ids=device_batch["input_ids"],
+                    attention_mask=device_batch["attention_mask"],
+                )
+
+            prediction_rows.extend(_extract_word_level_predictions(outputs.logits, batch, id2label))
+
+    usable_predictions = [row["pred_labels"] for row in prediction_rows if row["gold_labels"]]
+    usable_golds = [row["gold_labels"] for row in prediction_rows if row["gold_labels"]]
+
+    metrics = (
+        compute_metrics(usable_predictions, usable_golds)
+        if usable_golds
+        else {
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+            "accuracy": 0.0,
+            "classification_report": "No gold labels available for this split.",
+        }
+    )
+    average_loss = sum(losses) / len(losses) if losses else 0.0
+    return average_loss, metrics, prediction_rows
+
+
+def train_one_epoch(
+    model: torch.nn.Module,
+    dataloader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    scheduler: Any,
+    device: torch.device,
+    gradient_clip_norm: float | None,
+    epoch: int,
+    total_epochs: int,
+) -> float:
+    model.train()
+    running_loss = 0.0
+
+    progress = tqdm(dataloader, desc=f"train {epoch}/{total_epochs}", leave=False)
+    for batch in progress:
+        optimizer.zero_grad(set_to_none=True)
+        device_batch = _move_batch_to_device(batch, device)
+        outputs = model(
+            input_ids=device_batch["input_ids"],
+            attention_mask=device_batch["attention_mask"],
+            labels=device_batch["labels"],
+        )
+        loss = outputs.loss
+        loss.backward()
+
+        if gradient_clip_norm is not None:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
+
+        optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
+
+        running_loss += float(loss.detach().cpu().item())
+        progress.set_postfix(loss=f"{loss.item():.4f}")
+
+    return running_loss / max(1, len(dataloader))
+
+
+def _write_metrics_jsonl(path: Path, payload: dict[str, Any]) -> None:
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def _prepare_run_dir(config: dict[str, Any]) -> Path:
+    base_dir = ensure_dir(config["output_dir"])
+    run_name = config.get("run_name", "real_ner_run")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return ensure_dir(base_dir / f"{run_name}_{timestamp}")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train NER token classification baseline")
-    parser.add_argument("--model_name", type=str, required=True, choices=[
-        "google-bert/bert-base-multilingual-cased",
-        "FacebookAI/xlm-roberta-base",
-    ])
-    parser.add_argument("--train_file", type=str, default="data-baseline/en_ewt-ud-train.iob2")
-    parser.add_argument("--dev_file", type=str, default="data-baseline/en_ewt-ud-dev.iob2")
-    parser.add_argument("--output_dir", type=str, default="outputs")
-    parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--learning_rate", type=float, default=2e-5)
-    parser.add_argument("--weight_decay", type=float, default=0.01)
-    parser.add_argument("--max_length", type=int, default=128)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--checkpoint_dir", type=str, default=None)
-    parser.add_argument("--resume", type=str, default=None)
+    parser = argparse.ArgumentParser(description="Train real-data token classification model.")
+    parser.add_argument("--config", required=True, help="Path to YAML config.")
+    parser.add_argument("--smoke-test", action="store_true", help="Run on a tiny subset for one epoch.")
     args = parser.parse_args()
 
-    torch.manual_seed(args.seed)
+    config = load_yaml_config(args.config)
+    set_seed(int(config["seed"]))
 
-    train_path = Path(args.train_file)
-    dev_path = Path(args.dev_file)
-    output_dir = Path(args.output_dir)
-    ensure_dir(output_dir)
+    LOGGER.info("Loading dataset splits")
+    train_examples = load_split_csv(config["train_path"], "train")
+    validation_examples = load_split_csv(config["validation_path"], "validation")
+    test_examples = load_split_csv(config["test_path"], "test")
 
-    logging.info("Loading train/dev data")
-    train_examples = parse_iob2_file(train_path)
-    dev_examples = parse_iob2_file(dev_path)
+    if args.smoke_test:
+        LOGGER.info("Smoke test enabled: limiting train/validation to first 32 examples and one epoch")
+        train_examples = train_examples[:32]
+        validation_examples = validation_examples[:32]
+        config = dict(config)
+        config["epochs"] = 1
 
-    logging.info("Building label vocabulary")
-    label2id, id2label = build_label_vocab(train_examples, dev_examples)
+    output_dir = _prepare_run_dir(config)
+    save_config_copy(config, output_dir)
 
-    logging.info("Loading tokenizer and model")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    model = AutoModelForTokenClassification.from_pretrained(
-        args.model_name,
-        num_labels=len(label2id),
-        id2label=id2label,
-        label2id=label2id,
+    _log_dataset_stats("train", train_examples)
+    _log_dataset_stats("validation", validation_examples)
+    _log_dataset_stats("test", test_examples)
+
+    label2id, id2label = build_label_maps(train_examples, validation_examples, test_examples)
+    LOGGER.info("Label vocabulary: %s", label2id)
+    LOGGER.info("Number of labels: %s", len(label2id))
+
+    save_label_maps(label2id, id2label, output_dir)
+
+    tokenizer, resolved_tokenizer_name = load_tokenizer(config["model_name"])
+    LOGGER.info("Loaded tokenizer: requested=%s resolved=%s", config["model_name"], resolved_tokenizer_name)
+
+    train_dataset = TokenizedNERDataset(
+        train_examples,
+        tokenizer,
+        label2id,
+        max_length=int(config["max_length"]),
+        label_all_tokens=bool(config["label_all_tokens"]),
+    )
+    validation_dataset = TokenizedNERDataset(
+        validation_examples,
+        tokenizer,
+        label2id,
+        max_length=int(config["max_length"]),
+        label_all_tokens=bool(config["label_all_tokens"]),
     )
 
-    logging.info("Preparing datasets")
-    train_encodings = align_labels_with_tokens(train_examples, tokenizer, label2id, max_length=args.max_length)
-    dev_encodings = align_labels_with_tokens(dev_examples, tokenizer, label2id, max_length=args.max_length)
+    collator = create_data_collator(tokenizer)
+    pin_memory = torch.cuda.is_available()
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=int(config["batch_size"]),
+        shuffle=True,
+        num_workers=int(config.get("num_workers", 0)),
+        collate_fn=collator,
+        pin_memory=pin_memory,
+    )
+    validation_loader = DataLoader(
+        validation_dataset,
+        batch_size=int(config["eval_batch_size"]),
+        shuffle=False,
+        num_workers=int(config.get("num_workers", 0)),
+        collate_fn=collator,
+        pin_memory=pin_memory,
+    )
 
-    train_dataset = TokenClassificationDataset(train_encodings)
-    dev_dataset = TokenClassificationDataset(dev_encodings)
-
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-    dev_loader = DataLoader(dev_dataset, batch_size=args.batch_size, shuffle=False)
+    model, resolved_model_name = create_token_classifier(
+        config["model_name"],
+        num_labels=len(label2id),
+        label2id=label2id,
+        id2label=id2label,
+        dropout=config.get("dropout"),
+    )
+    LOGGER.info("Loaded model: requested=%s resolved=%s", config["model_name"], resolved_model_name)
+    LOGGER.info("Trainable parameters: %s", count_trainable_parameters(model))
 
     device = get_device()
     model.to(device)
+    optimizer = AdamW(
+        model.parameters(),
+        lr=float(config["learning_rate"]),
+        weight_decay=float(config["weight_decay"]),
+    )
+    total_steps = len(train_loader) * int(config["epochs"])
+    warmup_steps = int(total_steps * float(config["warmup_ratio"]))
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_steps,
+    )
 
-    optimizer = AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
-    total_steps = len(train_loader) * args.epochs
-    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=total_steps)
+    metrics_path = output_dir / "metrics.jsonl"
+    best_metric_name = str(config.get("save_best_metric", "f1"))
+    if best_metric_name != "f1":
+        raise ValueError(f"Unsupported save_best_metric={best_metric_name!r}; only 'f1' is supported.")
 
-    start_epoch = 1
-    best_f1 = 0.0
+    best_metric = float("-inf")
+    epochs = int(config["epochs"])
+    latest_summary: dict[str, Any] | None = None
 
-    if args.resume:
-        ckpt_path = None
+    for epoch in range(1, epochs + 1):
+        train_loss = train_one_epoch(
+            model,
+            train_loader,
+            optimizer,
+            scheduler,
+            device,
+            gradient_clip_norm=config.get("gradient_clip_norm"),
+            epoch=epoch,
+            total_epochs=epochs,
+        )
 
-        if args.resume == "auto" and args.checkpoint_dir:
-            candidate = Path(args.checkpoint_dir) / "last.pt"
-            if candidate.exists():
-                ckpt_path = candidate
-        else:
-            ckpt_path = Path(args.resume)
+        val_loss, val_metrics, prediction_rows = evaluate(
+            model,
+            validation_loader,
+            device,
+            id2label,
+        )
+        current_lr = optimizer.param_groups[0]["lr"]
 
-        if ckpt_path and ckpt_path.exists():
-            logging.info(f"Resuming from {ckpt_path}")
-            start_epoch, best_f1 = load_checkpoint(
-                ckpt_path, model, optimizer, scheduler
+        epoch_metrics = {
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "val_precision": val_metrics["precision"],
+            "val_recall": val_metrics["recall"],
+            "val_f1": val_metrics["f1"],
+            "val_accuracy": val_metrics["accuracy"],
+            "learning_rate": current_lr,
+        }
+        _write_metrics_jsonl(metrics_path, epoch_metrics)
+        LOGGER.info("Epoch metrics: %s", epoch_metrics)
+        LOGGER.info("Validation classification report:\n%s", val_metrics["classification_report"])
+
+        save_checkpoint(
+            output_dir / "last.pt",
+            model,
+            optimizer,
+            scheduler,
+            epoch=epoch,
+            best_metric=max(best_metric, val_metrics["f1"]) if best_metric != float("-inf") else val_metrics["f1"],
+            config=config,
+            label2id=label2id,
+            id2label=id2label,
+        )
+        save_predictions_table(
+            prediction_rows,
+            [row["gold_labels"] for row in prediction_rows],
+            [row["pred_labels"] for row in prediction_rows],
+            output_dir / "validation_predictions_last.jsonl",
+        )
+        save_predictions_table(
+            prediction_rows,
+            [row["gold_labels"] for row in prediction_rows],
+            [row["pred_labels"] for row in prediction_rows],
+            output_dir / "validation_predictions_last.csv",
+        )
+
+        if val_metrics["f1"] > best_metric:
+            best_metric = val_metrics["f1"]
+            save_checkpoint(
+                output_dir / "best.pt",
+                model,
+                optimizer,
+                scheduler,
+                epoch=epoch,
+                best_metric=best_metric,
+                config=config,
+                label2id=label2id,
+                id2label=id2label,
             )
-            start_epoch += 1
+            save_predictions_table(
+                prediction_rows,
+                [row["gold_labels"] for row in prediction_rows],
+                [row["pred_labels"] for row in prediction_rows],
+                output_dir / "validation_predictions_best.jsonl",
+            )
+            save_predictions_table(
+                prediction_rows,
+                [row["gold_labels"] for row in prediction_rows],
+                [row["pred_labels"] for row in prediction_rows],
+                output_dir / "validation_predictions_best.csv",
+            )
+            save_json(val_metrics, output_dir / "best_validation_metrics.json")
 
-    best_dir = output_dir / f"best_{make_safe_model_name(args.model_name)}"
+        latest_summary = epoch_metrics
 
-    for epoch in range(start_epoch, args.epochs + 1):
-        model.train()
-        running_loss = 0.0
+    if latest_summary is not None:
+        save_json(
+            {
+                "best_metric_name": best_metric_name,
+                "best_metric_value": best_metric,
+                "last_epoch_metrics": latest_summary,
+                "resolved_model_name": resolved_model_name,
+                "resolved_tokenizer_name": resolved_tokenizer_name,
+            },
+            output_dir / "run_summary.json",
+        )
 
-        for batch in train_loader:
-            optimizer.zero_grad()
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            labels = batch["labels"].to(device)
-
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-            loss = outputs.loss
-            loss.backward()
-            optimizer.step()
-            scheduler.step()
-
-            running_loss += loss.item()
-
-        avg_loss = running_loss / max(1, len(train_loader))
-        logging.info(f"Epoch {epoch}/{args.epochs} train loss: {avg_loss:.4f}")
-
-        eval_results = evaluate(model, dev_loader, id2label, device)
-        logging.info(f"Dev precision: {eval_results['precision']:.4f} recall: {eval_results['recall']:.4f} f1: {eval_results['f1']:.4f}")
-        logging.info("Dev classification report:\n%s", eval_results["report"])
-
-        if eval_results["f1"] > best_f1:
-            best_f1 = eval_results["f1"]
-            ensure_dir(best_dir)
-            model.save_pretrained(best_dir)
-            tokenizer.save_pretrained(best_dir)
-            logging.info(f"Saved best model to {best_dir} (F1={best_f1:.4f})")
-
-        dev_pred_path = output_dir / f"dev_predictions_{make_safe_model_name(args.model_name)}.iob2"
-        save_dev_predictions(dev_examples, eval_results["predictions"], dev_pred_path)
-
-        if args.checkpoint_dir:
-                ckpt_dir = Path(args.checkpoint_dir)
-                ensure_dir(ckpt_dir)
-
-                save_checkpoint(
-                    ckpt_dir / "last.pt",
-                    model,
-                    optimizer,
-                    scheduler,
-                    epoch,
-                    best_f1,
-                )
-
-    logging.info("Training finished. Best dev F1: %.4f", best_f1)
-    logging.info("Best model dir: %s", best_dir)
+    LOGGER.info("Training finished. Output directory: %s", output_dir)
 
 
 if __name__ == "__main__":

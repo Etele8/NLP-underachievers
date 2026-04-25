@@ -3,122 +3,115 @@ from __future__ import annotations
 import argparse
 import logging
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any
 
 import torch
 from torch.utils.data import DataLoader
-from transformers import AutoModelForTokenClassification, AutoTokenizer
 
-from data import parse_iob2_test_file
-from modeling import align_labels_with_tokens, get_device
-from utils import make_safe_model_name, ensure_dir
+from .data import TokenizedNERDataset, create_data_collator, load_split_csv
+from .evaluate import compute_metrics, save_predictions_table
+from .model_factory import create_token_classifier, load_tokenizer
+from .train import evaluate
+from .utils import ensure_dir, get_device, load_checkpoint, load_yaml_config, save_json
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+LOGGER = logging.getLogger(__name__)
 
 
-
-
-def reconstruct_test_output(line_items: List[Dict[str, Any]], pred_labels: List[str], output_file: Path) -> None:
-    idx = 0
-    with output_file.open("w", encoding="utf-8") as f:
-        for item in line_items:
-            if item["type"] == "blank":
-                f.write("\n")
-            elif item["type"] == "comment":
-                f.write(item["text"] + "\n")
-            elif item["type"] == "token":
-                if idx >= len(pred_labels):
-                    raise RuntimeError("Prediction count mismatch during reconstruction")
-
-                parts = item["parts"].copy()
-
-                if len(parts) >= 3 and parts[0].isdigit():
-                    parts[2] = pred_labels[idx]
-                elif len(parts) >= 2:
-                    parts[1] = pred_labels[idx]
-                else:
-                    parts.append(pred_labels[idx])
-
-                f.write("\t".join(parts) + "\n")
-                idx += 1
-
-    if idx != len(pred_labels):
-        raise RuntimeError("Not all predictions were consumed during reconstruction")
+def _select_split(config: dict[str, Any], split: str) -> tuple[str, list[dict[str, Any]]]:
+    if split == "train":
+        return config["train_path"], load_split_csv(config["train_path"], "train")
+    if split == "validation":
+        return config["validation_path"], load_split_csv(config["validation_path"], "validation")
+    if split == "test":
+        return config["test_path"], load_split_csv(config["test_path"], "test")
+    raise ValueError(f"Unsupported split={split!r}")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Predict test file with NER token classification model")
-    parser.add_argument("--checkpoint", type=str, required=True)
-    parser.add_argument("--test_file", type=str, default="data-baseline/en_ewt-ud-test-masked.iob2")
-    parser.add_argument("--output_dir", type=str, default="outputs")
-    parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--max_length", type=int, default=128)
-    parser.add_argument("--id2label_file", type=str, default=None)
-    parser.add_argument("--model_name", type=str, default=None)
+    parser = argparse.ArgumentParser(description="Run prediction for the real-data NER pipeline.")
+    parser.add_argument("--config", required=True, help="Path to YAML config.")
+    parser.add_argument("--checkpoint", required=True, help="Path to a saved checkpoint.")
+    parser.add_argument("--split", required=True, choices=["train", "validation", "test"])
     args = parser.parse_args()
 
-    checkpoint = Path(args.checkpoint)
-    output_dir = Path(args.output_dir)
-    ensure_dir(output_dir)
+    config = load_yaml_config(args.config)
+    checkpoint_path = Path(args.checkpoint)
+    run_output_dir = ensure_dir(checkpoint_path.parent)
 
-    model = AutoModelForTokenClassification.from_pretrained(str(checkpoint))
-    tokenizer = AutoTokenizer.from_pretrained(str(checkpoint))
+    _, examples = _select_split(config, args.split)
 
-    # id2label is stored in model.config
-    id2label = {int(k): v for k, v in model.config.id2label.items()} if model.config.id2label else {}
-    if not id2label:
-        raise ValueError("id2label mapping missing from model config")
+    tokenizer, resolved_tokenizer_name = load_tokenizer(config["model_name"])
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    label2id = checkpoint["label2id"]
+    id2label = {int(idx): label for idx, label in checkpoint["id2label"].items()}
 
-    test_path = Path(args.test_file)
-    test_examples, line_items = parse_iob2_test_file(test_path)
+    model, resolved_model_name = create_token_classifier(
+        config["model_name"],
+        num_labels=len(label2id),
+        label2id=label2id,
+        id2label=id2label,
+        dropout=config.get("dropout"),
+    )
+    load_checkpoint(checkpoint_path, model)
+
+    dataset = TokenizedNERDataset(
+        examples,
+        tokenizer,
+        label2id=label2id,
+        max_length=int(config["max_length"]),
+        label_all_tokens=bool(config["label_all_tokens"]),
+    )
+    dataloader = DataLoader(
+        dataset,
+        batch_size=int(config["eval_batch_size"]),
+        shuffle=False,
+        num_workers=int(config.get("num_workers", 0)),
+        collate_fn=create_data_collator(tokenizer),
+        pin_memory=torch.cuda.is_available(),
+    )
 
     device = get_device()
     model.to(device)
+    loss, metrics, prediction_rows = evaluate(model, dataloader, device, id2label)
 
-    tokenized_test = align_labels_with_tokens(test_examples, tokenizer, label2id={}, max_length=args.max_length)
+    predictions_jsonl = run_output_dir / f"predictions_{args.split}.jsonl"
+    predictions_csv = run_output_dir / f"predictions_{args.split}.csv"
+    save_predictions_table(
+        prediction_rows,
+        [row["gold_labels"] for row in prediction_rows],
+        [row["pred_labels"] for row in prediction_rows],
+        predictions_jsonl,
+    )
+    save_predictions_table(
+        prediction_rows,
+        [row["gold_labels"] for row in prediction_rows],
+        [row["pred_labels"] for row in prediction_rows],
+        predictions_csv,
+    )
 
-    input_ids = torch.tensor(tokenized_test["input_ids"], dtype=torch.long)
-    attention_mask = torch.tensor(tokenized_test["attention_mask"], dtype=torch.long)
-    word_ids_list = tokenized_test.get("word_ids", [])
-
-    dataset = torch.utils.data.TensorDataset(input_ids, attention_mask)
-    dataloader = DataLoader(dataset, batch_size=args.batch_size)
-
-    raw_preds: List[str] = []
-    model.eval()
-    with torch.no_grad():
-        batch_start = 0
-        for batch in dataloader:
-            batch_input_ids = batch[0].to(device)
-            batch_attention_mask = batch[1].to(device)
-            outputs = model(input_ids=batch_input_ids, attention_mask=batch_attention_mask)
-            logits = outputs.logits
-            preds = torch.argmax(logits, dim=-1).cpu().tolist()
-
-            for local_idx, pred_row in enumerate(preds):
-                global_idx = batch_start + local_idx
-                if global_idx >= len(word_ids_list):
-                    break
-                word_ids = word_ids_list[global_idx]
-                prev = None
-                for p, word_idx in zip(pred_row, word_ids):
-                    if word_idx is None:
-                        continue
-                    if word_idx != prev:
-                        raw_preds.append(id2label[p])
-                        prev = word_idx
-            batch_start += len(preds)
-
-    if args.model_name is None:
-        safe_model_name = make_safe_model_name(checkpoint.name)
+    labeled_predictions = [row["pred_labels"] for row in prediction_rows if row["gold_labels"]]
+    labeled_golds = [row["gold_labels"] for row in prediction_rows if row["gold_labels"]]
+    if labeled_golds:
+        metrics = compute_metrics(labeled_predictions, labeled_golds)
+        save_json({"loss": loss, **metrics}, run_output_dir / f"metrics_{args.split}.json")
+        (run_output_dir / f"classification_report_{args.split}.txt").write_text(
+            metrics["classification_report"],
+            encoding="utf-8",
+        )
+        LOGGER.info("Saved prediction metrics for split=%s", args.split)
     else:
-        safe_model_name = make_safe_model_name(args.model_name)
-
-    output_file = output_dir / f"predictions_{safe_model_name}.iob2"
-    reconstruct_test_output(line_items, raw_preds, output_file)
-
-    logging.info("Test predictions written to %s", output_file)
+        save_json(
+            {
+                "loss": loss,
+                "classification_report": "No gold labels available for this split.",
+                "resolved_model_name": resolved_model_name,
+                "resolved_tokenizer_name": resolved_tokenizer_name,
+            },
+            run_output_dir / f"metrics_{args.split}.json",
+        )
+        LOGGER.info("Split=%s has no usable gold labels; saved predictions without seqeval metrics", args.split)
 
 
 if __name__ == "__main__":
