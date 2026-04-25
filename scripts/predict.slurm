@@ -1,16 +1,18 @@
 #!/bin/bash
-#SBATCH --job-name=real_ner_train
-#SBATCH --output=outputs/slurm_logs/train_%j.out
-#SBATCH --error=outputs/slurm_logs/train_%j.err
+#SBATCH --job-name=real_ner_predict
+#SBATCH --output=outputs/slurm_logs/predict_%j.out
+#SBATCH --error=outputs/slurm_logs/predict_%j.err
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=24G
-#SBATCH --time=24:00:00
+#SBATCH --time=08:00:00
 
 set -euo pipefail
 
 CONFIG=${CONFIG:-configs/mbert.yaml}
+CHECKPOINT=${CHECKPOINT:?Please set CHECKPOINT=/path/to/best.pt}
+SPLIT=${SPLIT:-test}
 
 mkdir -p outputs/slurm_logs
 
@@ -26,4 +28,4 @@ print("cuda_available:", torch.cuda.is_available())
 print("cuda_device_count:", torch.cuda.device_count())
 PY
 
-uv run python -m src.train --config "$CONFIG"
+uv run python -m src.predict --config "$CONFIG" --checkpoint "$CHECKPOINT" --split "$SPLIT"
