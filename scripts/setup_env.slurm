@@ -18,8 +18,10 @@ source .venv/bin/activate
 
 uv pip install --python .venv/bin/python --index-url https://download.pytorch.org/whl/cu126 torch==2.10.0
 
-TORCH_LIB_DIR="$(echo .venv/lib/python*/site-packages/torch/lib)"
-export LD_LIBRARY_PATH="$PWD/$TORCH_LIB_DIR:${LD_LIBRARY_PATH:-}"
+TORCH_SITE_PACKAGES="$(echo "$PWD"/.venv/lib/python*/site-packages)"
+TORCH_LIB_DIR="$TORCH_SITE_PACKAGES/torch/lib"
+NVIDIA_LIB_DIRS="$(find "$TORCH_SITE_PACKAGES/nvidia" -maxdepth 2 -type d -name lib 2>/dev/null | tr '\n' ':')"
+export LD_LIBRARY_PATH="${TORCH_LIB_DIR}:${NVIDIA_LIB_DIRS}${LD_LIBRARY_PATH:-}"
 
 python - <<'EOF'
 import os
