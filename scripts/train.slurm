@@ -22,12 +22,17 @@ echo "PWD: $(pwd)"
 echo "Python: $(command -v python || true)"
 echo "Venv Python: $PROJECT_DIR/.venv/bin/python"
 
+TORCH_LIB_DIR="$(echo .venv/lib/python*/site-packages/torch/lib)"
+export LD_LIBRARY_PATH="$PROJECT_DIR/$TORCH_LIB_DIR:${LD_LIBRARY_PATH:-}"
+
 .venv/bin/python - <<'PY'
+import os
 import torch
 import sys
 print("sys.executable:", sys.executable)
 print("torch_version:", torch.__version__)
 print("torch_cuda_version:", torch.version.cuda)
+print("LD_LIBRARY_PATH:", os.environ.get("LD_LIBRARY_PATH", ""))
 print("cuda_available:", torch.cuda.is_available())
 print("cuda_device_count:", torch.cuda.device_count())
 PY
