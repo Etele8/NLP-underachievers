@@ -192,19 +192,16 @@ def _write_metrics_jsonl(path: Path, payload: dict[str, Any]) -> None:
 
 
 def _prepare_run_dir(config: dict[str, Any]) -> Path:
+    if "run_dir" in config:
+        return ensure_dir(config["run_dir"])
+
     base_dir = ensure_dir(config["output_dir"])
     run_name = config.get("run_name", "real_ner_run")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return ensure_dir(base_dir / f"{run_name}_{timestamp}")
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Train real-data token classification model.")
-    parser.add_argument("--config", required=True, help="Path to YAML config.")
-    parser.add_argument("--smoke-test", action="store_true", help="Run on a tiny subset for one epoch.")
-    args = parser.parse_args()
-
-    config = load_yaml_config(args.config)
+def train(config: dict[str, Any], smoke_test: bool = False) -> dict[str, Any]:
     set_seed(int(config["seed"]))
 
     LOGGER.info("Loading dataset splits")
@@ -212,7 +209,7 @@ def main() -> None:
     validation_examples = load_split_csv(config["validation_path"], "validation")
     test_examples = load_split_csv(config["test_path"], "test")
 
-    if args.smoke_test:
+    if smoke_test:
         LOGGER.info("Smoke test enabled: limiting train/validation to first 32 examples and one epoch")
         train_examples = train_examples[:32]
         validation_examples = validation_examples[:32]
@@ -391,18 +388,40 @@ def main() -> None:
         latest_summary = epoch_metrics
 
     if latest_summary is not None:
-        save_json(
-            {
-                "best_metric_name": best_metric_name,
-                "best_metric_value": best_metric,
-                "last_epoch_metrics": latest_summary,
-                "resolved_model_name": resolved_model_name,
-                "resolved_tokenizer_name": resolved_tokenizer_name,
-            },
-            output_dir / "run_summary.json",
-        )
+        run_summary = {
+            "best_metric_name": best_metric_name,
+            "best_metric_value": best_metric,
+            "last_epoch_metrics": latest_summary,
+            "resolved_model_name": resolved_model_name,
+            "resolved_tokenizer_name": resolved_tokenizer_name,
+            "output_dir": str(output_dir),
+            "best_checkpoint": str(output_dir / "best.pt"),
+            "last_checkpoint": str(output_dir / "last.pt"),
+        }
+        save_json(run_summary, output_dir / "run_summary.json")
+    else:
+        run_summary = {
+            "best_metric_name": best_metric_name,
+            "best_metric_value": best_metric,
+            "last_epoch_metrics": {},
+            "resolved_model_name": resolved_model_name,
+            "resolved_tokenizer_name": resolved_tokenizer_name,
+            "output_dir": str(output_dir),
+            "best_checkpoint": "",
+            "last_checkpoint": "",
+        }
 
     LOGGER.info("Training finished. Output directory: %s", output_dir)
+    return run_summary
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Train real-data token classification model.")
+    parser.add_argument("--config", required=True, help="Path to YAML config.")
+    parser.add_argument("--smoke-test", action="store_true", help="Run on a tiny subset for one epoch.")
+    args = parser.parse_args()
+
+    train(load_yaml_config(args.config), smoke_test=args.smoke_test)
 
 
 if __name__ == "__main__":

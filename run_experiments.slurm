@@ -11,4 +11,9 @@ set -euo pipefail
 
 mkdir -p logs
 
-python run_experiments.py
+PYTHON_BIN="${PYTHON_BIN:-.venv/bin/python}"
+if [ ! -x "$PYTHON_BIN" ]; then
+  PYTHON_BIN="$(command -v python)"
+fi
+
+"$PYTHON_BIN" run_experiments.py

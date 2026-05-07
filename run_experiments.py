@@ -1,16 +1,13 @@
 from __future__ import annotations
 
-import importlib
-import inspect
 import json
 import traceback
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from experiments.configs import experiments
-from models.factory import get_model
-from utils.checkpoints import get_latest_checkpoint, load_checkpoint, save_checkpoint
+from src.train import train as train_model
+from src.utils import load_yaml_config, save_config_copy
 from utils.logger import log_error, log_metrics, save_config
 
 
@@ -23,12 +20,15 @@ BASELINE_CONFIG = {
     "max_seq_length": 128,
 }
 
-DEFAULT_NUM_LABELS = 2
 OUTPUT_ROOT = Path("outputs")
-TRAIN_MODULE_CANDIDATES = ("train", "trainer", "training", "src.train")
+CONFIG_ROOT = Path("configs")
 MODEL_OUTPUT_DIRS = {
     "mbert": "mber",
     "xlmr": "xlmr",
+}
+MODEL_CONFIG_FILES = {
+    "mbert": CONFIG_ROOT / "mbert.yaml",
+    "xlmr": CONFIG_ROOT / "xlmr.yaml",
 }
 
 # These keys define experiment identity. Keeping model and LoRA here prevents
@@ -140,70 +140,6 @@ def build_output_dir(config: dict[str, Any], baseline_config: dict[str, Any]) ->
     return output_root / "mixed" / folder_name
 
 
-def _find_train_function() -> Callable[..., Any]:
-    """Find an existing train(...) function without importing dataset code directly."""
-    import_errors: list[str] = []
-    for module_name in TRAIN_MODULE_CANDIDATES:
-        try:
-            module = importlib.import_module(module_name)
-        except Exception as exc:
-            import_errors.append(f"{module_name}: {exc}")
-            continue
-
-        train_fn = getattr(module, "train", None)
-        if callable(train_fn):
-            return train_fn
-
-    details = "\n".join(import_errors) if import_errors else "No import errors were raised."
-    raise RuntimeError(
-        "Could not find a callable train function. Expected train(...) in one of: "
-        f"{', '.join(TRAIN_MODULE_CANDIDATES)}.\nImport details:\n{details}"
-    )
-
-
-def _call_training_flexibly(
-    train_fn: Callable[..., Any],
-    model,
-    config: dict[str, Any],
-    output_dir: Path,
-) -> Any:
-    """Try common training signatures used in collaborative ML repos."""
-    attempts = (
-        (
-            "train(model=model, config=config, output_dir=...)",
-            (),
-            {"model": model, "config": config, "output_dir": str(output_dir)},
-        ),
-        ("train(model, config)", (model, config), {}),
-        ("train(config)", (config,), {}),
-    )
-    errors: list[str] = []
-
-    for description, args, kwargs in attempts:
-        try:
-            # Prefer signature binding so incompatible call shapes are skipped
-            # before any training side effects begin.
-            inspect.signature(train_fn).bind(*args, **kwargs)
-            return train_fn(*args, **kwargs)
-        except TypeError as exc:
-            errors.append(f"{description}: {exc}")
-
-    raise RuntimeError(
-        "Found train function, but none of the supported call styles worked. "
-        f"Errors: {json.dumps(errors, indent=2)}"
-    )
-
-
-def _infer_num_labels(config: dict[str, Any]) -> int:
-    """Infer label count when config provides it; otherwise use a safe placeholder."""
-    if "num_labels" in config:
-        return int(config["num_labels"])
-    label2id = config.get("label2id")
-    if isinstance(label2id, dict):
-        return len(label2id)
-    return DEFAULT_NUM_LABELS
-
-
 def _json_default(value: Any) -> str:
     """Keep logging resilient when training returns non-JSON objects."""
     return str(value)
@@ -218,50 +154,42 @@ def _write_metrics_json(metrics: dict[str, Any], output_dir: Path) -> Path:
     return metrics_path
 
 
-def _unique_checkpoint_name() -> str:
-    """Create a checkpoint filename that will not overwrite older savepoints."""
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    return f"checkpoint_{timestamp}.pt"
-
-
-def _prepare_experiment_dir(output_dir: Path) -> Path:
+def _prepare_experiment_dir(output_dir: Path) -> None:
     """Create the required output layout safely."""
-    checkpoint_dir = output_dir / "checkpoint"
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    return checkpoint_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+
+def _load_model_training_template(model_key: str) -> dict[str, Any]:
+    config_path = MODEL_CONFIG_FILES.get(model_key)
+    if config_path is None:
+        supported = ", ".join(sorted(MODEL_CONFIG_FILES))
+        raise ValueError(f"Unknown model {model_key!r}. Supported models: {supported}")
+    return load_yaml_config(config_path)
 
 
 def _build_training_config(
     config: dict[str, Any],
     output_dir: Path,
-    checkpoint_dir: Path,
 ) -> dict[str, Any]:
-    """Add non-invasive runtime hints commonly expected by training code."""
-    training_config = dict(config)
-    training_config.setdefault("learning_rate", config.get("lr"))
-    training_config.setdefault("max_length", config.get("max_seq_length"))
-    training_config.setdefault("output_dir", str(output_dir))
-    training_config.setdefault("checkpoint_dir", str(checkpoint_dir))
-    return training_config
+    """Build the src.train YAML-style config for one sweep item."""
+    model_key = str(config["model"]).lower()
+    training_config = _load_model_training_template(model_key)
+    experiment_name = output_dir.name
 
-
-def _load_existing_checkpoint_if_present(model, checkpoint_dir: Path):
-    latest_checkpoint = get_latest_checkpoint(checkpoint_dir)
-    if latest_checkpoint is None:
-        return model, {}
-
-    print(f"Resuming from checkpoint ... {latest_checkpoint}")
-    model, _, _, metadata = load_checkpoint(latest_checkpoint, model)
-    return model, metadata
-
-
-def _save_completion_checkpoint(model, checkpoint_dir: Path) -> Path:
-    """Save an end-of-experiment checkpoint without overwriting older checkpoints."""
-    return save_checkpoint(
-        model,
-        output_dir=checkpoint_dir,
-        filename=_unique_checkpoint_name(),
+    training_config.update(
+        {
+            "run_name": experiment_name,
+            "run_dir": str(output_dir),
+            "output_dir": str(output_dir),
+            "learning_rate": config["lr"],
+            "batch_size": config["batch_size"],
+            "epochs": config["epochs"],
+            "weight_decay": config["weight_decay"],
+            "max_length": config["max_seq_length"],
+            "experiment": config,
+        }
     )
+    return training_config
 
 
 def run_single_experiment(
@@ -269,38 +197,26 @@ def run_single_experiment(
     baseline_config: dict[str, Any],
 ) -> None:
     output_dir = build_output_dir(config, baseline_config)
-    checkpoint_dir = _prepare_experiment_dir(output_dir)
+    _prepare_experiment_dir(output_dir)
 
     print("\n=== Running experiment ===")
     print(f"Output directory: {output_dir}")
     print(f"Config: {json.dumps(config, sort_keys=True)}")
 
-    training_config = _build_training_config(config, output_dir, checkpoint_dir)
+    training_config = _build_training_config(config, output_dir)
 
     save_config(training_config, output_dir)
+    save_config_copy(training_config, output_dir)
     log_metrics({"event": "started", "output_dir": str(output_dir)}, output_dir)
 
-    train_fn = _find_train_function()
-    model = get_model(training_config, num_labels=_infer_num_labels(training_config))
-    model, checkpoint_metadata = _load_existing_checkpoint_if_present(model, checkpoint_dir)
-    if checkpoint_metadata:
-        log_metrics(
-            {
-                "event": "resumed",
-                "output_dir": str(output_dir),
-                "checkpoint_metadata": checkpoint_metadata,
-            },
-            output_dir,
-        )
-
-    result = _call_training_flexibly(train_fn, model, training_config, output_dir)
-    checkpoint_path = _save_completion_checkpoint(model, checkpoint_dir)
+    result = train_model(training_config)
+    checkpoint_path = result.get("best_checkpoint") or result.get("last_checkpoint") or ""
 
     metrics = {
         "status": "success",
         "output_dir": str(output_dir),
         "checkpoint": str(checkpoint_path),
-        "result": result if isinstance(result, dict) else {},
+        "result": result,
     }
     _write_metrics_json(metrics, output_dir)
     log_metrics(
