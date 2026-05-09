@@ -11,6 +11,8 @@ from src.utils import load_yaml_config, save_config_copy
 from utils.logger import log_error, log_metrics, save_config
 
 
+PROJECT_ROOT = Path(__file__).resolve().parent
+
 BASELINE_CONFIG = {
     "model": "mbert",
     "lr": 3e-5,
@@ -20,8 +22,8 @@ BASELINE_CONFIG = {
     "max_seq_length": 128,
 }
 
-OUTPUT_ROOT = Path("outputs")
-CONFIG_ROOT = Path("configs")
+OUTPUT_ROOT = PROJECT_ROOT / "outputs"
+CONFIG_ROOT = PROJECT_ROOT / "configs"
 MODEL_OUTPUT_DIRS = {
     "mbert": "mber",
     "xlmr": "xlmr",
@@ -167,6 +169,13 @@ def _load_model_training_template(model_key: str) -> dict[str, Any]:
     return load_yaml_config(config_path)
 
 
+def _resolve_project_path(path: str | Path) -> Path:
+    path_obj = Path(path)
+    if path_obj.is_absolute():
+        return path_obj
+    return PROJECT_ROOT / path_obj
+
+
 def _build_training_config(
     config: dict[str, Any],
     output_dir: Path,
@@ -189,7 +198,32 @@ def _build_training_config(
             "experiment": config,
         }
     )
+    for key in ("train_path", "validation_path", "test_path"):
+        training_config[key] = str(_resolve_project_path(training_config[key]))
     return training_config
+
+
+def _required_data_paths() -> list[Path]:
+    """Return all dataset files needed by the configured model templates."""
+    paths: set[Path] = set()
+    for model_key in MODEL_CONFIG_FILES:
+        training_config = _load_model_training_template(model_key)
+        for key in ("train_path", "validation_path", "test_path"):
+            paths.add(_resolve_project_path(training_config[key]))
+    return sorted(paths)
+
+
+def _validate_required_data() -> None:
+    missing_paths = [path for path in _required_data_paths() if not path.exists()]
+    if not missing_paths:
+        return
+
+    missing = "\n".join(f"- {path}" for path in missing_paths)
+    raise FileNotFoundError(
+        "Missing required dataset files:\n"
+        f"{missing}\n"
+        "Download them with: .venv/bin/python scripts/download_data.py"
+    )
 
 
 def run_single_experiment(
@@ -232,6 +266,8 @@ def run_single_experiment(
 
 
 def run_all_experiments() -> None:
+    _validate_required_data()
+
     for index, config in enumerate(experiments, start=1):
         output_dir = build_output_dir(config, BASELINE_CONFIG)
         print(f"\n[{index}/{len(experiments)}] Starting: {output_dir}")
