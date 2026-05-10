@@ -207,7 +207,11 @@ def _is_completed(output_dir: Path) -> bool:
         return False
 
     with metrics_path.open("r", encoding="utf-8") as handle:
-        metrics = json.load(handle)
+        try:
+            metrics = json.load(handle)
+        except json.JSONDecodeError:
+            print(f"Ignoring incomplete metrics file: {metrics_path}")
+            return False
     return metrics.get("status") == "success"
 
 

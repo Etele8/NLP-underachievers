@@ -10,6 +10,7 @@
 
 set -euo pipefail
 
+cd "$SLURM_SUBMIT_DIR"
 mkdir -p logs
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
 
