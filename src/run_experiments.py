@@ -8,8 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from experiments.configs import experiments
-from src.utils import load_yaml_config, save_config_copy
-from utils.logger import log_error, log_metrics, save_config
+from src.utils import load_yaml_config, log_error, log_metrics, save_config, save_config_copy
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
