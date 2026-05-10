@@ -1,4 +1,4 @@
-# folders
+# project-specific directories
 /data
 /data-baseline
 /checkpoints
@@ -6,9 +6,14 @@
 /legacy_baseline
 /outputs
 
-# extensions
-*.json
+# model artefacts
 *.safetensors
+*.pt
+*.bin
+
+# experiment outputs (JSON/CSV inside outputs/ are already covered above)
+# but prevent accidental tracking of top-level one-off JSON dumps
+/*.json
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
