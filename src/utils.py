@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import csv
 import json
 import random
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
 import yaml
+
+
+LOG_FIELDS = ["timestamp", "event", "experiment", "metrics_json"]
 
 
 def set_seed(seed: int) -> None:
@@ -81,6 +86,39 @@ def save_checkpoint(
     path_obj = Path(path)
     torch.save(checkpoint, path_obj)
     return path_obj
+
+
+def save_config(config: dict[str, Any], output_dir: str | Path) -> Path:
+    output_path = ensure_dir(output_dir) / "config.json"
+    with output_path.open("w", encoding="utf-8") as handle:
+        json.dump(config, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    return output_path
+
+
+def log_metrics(metrics_dict: dict[str, Any], output_dir: str | Path) -> Path:
+    output_path = ensure_dir(output_dir) / "logs.csv"
+    write_header = not output_path.exists() or output_path.stat().st_size == 0
+    row = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "event": metrics_dict.get("event", ""),
+        "experiment": metrics_dict.get("experiment", ""),
+        "metrics_json": json.dumps(metrics_dict, sort_keys=True),
+    }
+    with output_path.open("a", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=LOG_FIELDS)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+    return output_path
+
+
+def log_error(error_message: str, output_dir: str | Path) -> Path:
+    output_path = ensure_dir(output_dir) / "error.log"
+    with output_path.open("a", encoding="utf-8") as handle:
+        handle.write(error_message.rstrip())
+        handle.write("\n")
+    return output_path
 
 
 def load_checkpoint(
