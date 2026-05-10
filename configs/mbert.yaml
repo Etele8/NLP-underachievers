@@ -17,3 +17,7 @@ gradient_clip_norm: 1.0
 dropout: null
 num_workers: 0
 save_best_metric: "f1"
+use_language_bias: false
+use_lid_feature: false
+language_embedding_dim: 32
+language_gate_hidden_dim: 128

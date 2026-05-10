@@ -16,9 +16,12 @@ from transformers import get_linear_schedule_with_warmup
 from .data import (
     TokenizedNERDataset,
     build_label_maps,
+    build_lid_maps,
     create_data_collator,
     load_split_csv,
     save_label_maps,
+    save_lid_maps,
+    summarize_entity_language_bias,
     summarize_examples,
 )
 from .evaluate import compute_metrics, save_predictions_table
@@ -73,6 +76,7 @@ def _extract_word_level_predictions(
         word_ids = batch["word_ids"][example_index]
         tokens = batch["tokens"][example_index]
         gold_labels = batch["gold_labels"][example_index]
+        lid_tags = batch["lid_tags"][example_index]
         has_labels = batch["has_labels"][example_index]
         seen_word_ids: list[int] = []
         seen_word_id_set: set[int] = set()
@@ -87,11 +91,13 @@ def _extract_word_level_predictions(
 
         observed_tokens = [tokens[word_id] for word_id in seen_word_ids]
         observed_golds = [gold_labels[word_id] for word_id in seen_word_ids] if has_labels else []
+        observed_lids = [lid_tags[word_id] for word_id in seen_word_ids]
         rows.append(
             {
                 "id": batch["example_ids"][example_index],
                 "split": batch["splits"][example_index],
                 "tokens": observed_tokens,
+                "lid_tags": observed_lids,
                 "pred_labels": row_predictions,
                 "gold_labels": observed_golds,
                 "truncated": len(observed_tokens) < len(tokens),
@@ -120,6 +126,7 @@ def evaluate(
                 outputs = model(
                     input_ids=device_batch["input_ids"],
                     attention_mask=device_batch["attention_mask"],
+                    lid_ids=device_batch["lid_ids"],
                     labels=device_batch["labels"],
                 )
                 losses.append(float(outputs.loss.detach().cpu().item()))
@@ -127,6 +134,7 @@ def evaluate(
                 outputs = model(
                     input_ids=device_batch["input_ids"],
                     attention_mask=device_batch["attention_mask"],
+                    lid_ids=device_batch["lid_ids"],
                 )
 
             prediction_rows.extend(_extract_word_level_predictions(outputs.logits, batch, id2label))
@@ -169,6 +177,7 @@ def train_one_epoch(
         outputs = model(
             input_ids=device_batch["input_ids"],
             attention_mask=device_batch["attention_mask"],
+            lid_ids=device_batch["lid_ids"],
             labels=device_batch["labels"],
         )
         loss = outputs.loss
@@ -232,10 +241,15 @@ def train(config: dict[str, Any], smoke_test: bool = False) -> dict[str, Any]:
     _log_dataset_stats("test", test_examples)
 
     label2id, id2label = build_label_maps(train_examples, validation_examples, test_examples)
+    lid2id, id2lid = build_lid_maps(train_examples, validation_examples, test_examples)
     LOGGER.info("Label vocabulary: %s", label2id)
     LOGGER.info("Number of labels: %s", len(label2id))
+    LOGGER.info("Language ID vocabulary: %s", lid2id)
 
     save_label_maps(label2id, id2label, output_dir)
+    save_lid_maps(lid2id, id2lid, output_dir)
+    save_json(summarize_entity_language_bias(train_examples), output_dir / "train_entity_language_bias.json")
+    save_json(summarize_entity_language_bias(validation_examples), output_dir / "validation_entity_language_bias.json")
 
     tokenizer, resolved_tokenizer_name = load_tokenizer(config["model_name"])
     LOGGER.info("Loaded tokenizer: requested=%s resolved=%s", config["model_name"], resolved_tokenizer_name)
@@ -244,6 +258,7 @@ def train(config: dict[str, Any], smoke_test: bool = False) -> dict[str, Any]:
         train_examples,
         tokenizer,
         label2id,
+        lid2id,
         max_length=int(config["max_length"]),
         label_all_tokens=bool(config["label_all_tokens"]),
     )
@@ -251,6 +266,7 @@ def train(config: dict[str, Any], smoke_test: bool = False) -> dict[str, Any]:
         validation_examples,
         tokenizer,
         label2id,
+        lid2id,
         max_length=int(config["max_length"]),
         label_all_tokens=bool(config["label_all_tokens"]),
     )
@@ -279,7 +295,12 @@ def train(config: dict[str, Any], smoke_test: bool = False) -> dict[str, Any]:
         num_labels=len(label2id),
         label2id=label2id,
         id2label=id2label,
+        lid2id=lid2id,
         dropout=config.get("dropout"),
+        use_language_bias=bool(config.get("use_language_bias", False)),
+        use_lid_feature=bool(config.get("use_lid_feature", False)),
+        language_embedding_dim=int(config.get("language_embedding_dim", 32)),
+        language_gate_hidden_dim=int(config.get("language_gate_hidden_dim", 128)),
     )
     LOGGER.info("Loaded model: requested=%s resolved=%s", config["model_name"], resolved_model_name)
     LOGGER.info("Trainable parameters: %s", count_trainable_parameters(model))
@@ -377,6 +398,8 @@ def train(config: dict[str, Any], smoke_test: bool = False) -> dict[str, Any]:
             config=config,
             label2id=label2id,
             id2label=id2label,
+            lid2id=lid2id,
+            id2lid=id2lid,
         )
         save_predictions_table(
             prediction_rows,
@@ -403,6 +426,8 @@ def train(config: dict[str, Any], smoke_test: bool = False) -> dict[str, Any]:
                 config=config,
                 label2id=label2id,
                 id2label=id2label,
+                lid2id=lid2id,
+                id2lid=id2lid,
             )
             save_predictions_table(
                 prediction_rows,

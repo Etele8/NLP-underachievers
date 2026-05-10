@@ -102,6 +102,17 @@ def load_split_csv(path: str | Path, split_name: str) -> list[dict[str, Any]]:
                 f"Failed parsing ner for split={split_name}, row_id={row_id}: {exc}"
             ) from exc
 
+        lid_tags: list[str]
+        if "lid" in frame.columns:
+            try:
+                lid_tags = parse_list_cell(row["lid"])
+            except ValueError as exc:
+                raise ValueError(
+                    f"Failed parsing lid for split={split_name}, row_id={row_id}: {exc}"
+                ) from exc
+        else:
+            lid_tags = ["unknown"] * len(tokens)
+
         if not tokens:
             raise ValueError(f"Empty token list for split={split_name}, row_id={row_id}")
         if len(tokens) != len(ner_tags):
@@ -109,6 +120,13 @@ def load_split_csv(path: str | Path, split_name: str) -> list[dict[str, Any]]:
                 f"Length mismatch for split={split_name}, row_id={row_id}: "
                 f"{len(tokens)} tokens vs {len(ner_tags)} labels"
             )
+        if len(tokens) != len(lid_tags):
+            raise ValueError(
+                f"Length mismatch for split={split_name}, row_id={row_id}: "
+                f"{len(tokens)} tokens vs {len(lid_tags)} language IDs"
+            )
+        if any(not lid_tag for lid_tag in lid_tags):
+            raise ValueError(f"Encountered blank lid token for split={split_name}, row_id={row_id}")
 
         has_labels = _has_usable_labels(ner_tags)
         if not has_labels and split_name != "test":
@@ -130,6 +148,7 @@ def load_split_csv(path: str | Path, split_name: str) -> list[dict[str, Any]]:
                 "split": split_name,
                 "tokens": tokens,
                 "ner_tags": ner_tags,
+                "lid_tags": lid_tags,
                 "has_labels": has_labels,
             }
         )
@@ -165,12 +184,66 @@ def save_label_maps(label2id: dict[str, int], id2label: dict[int, str], output_d
     return output_path
 
 
+def build_lid_maps(
+    train_examples: list[dict[str, Any]],
+    val_examples: list[dict[str, Any]],
+    test_examples: list[dict[str, Any]] | None = None,
+) -> tuple[dict[str, int], dict[int, str]]:
+    lid_values = sorted(
+        {
+            lid_tag
+            for example in [*train_examples, *val_examples, *(test_examples or [])]
+            for lid_tag in example.get("lid_tags", [])
+        }
+    )
+    ordered_values = [*lid_values, "<pad>"]
+    lid2id = {lid: idx for idx, lid in enumerate(ordered_values)}
+    id2lid = {idx: lid for lid, idx in lid2id.items()}
+    return lid2id, id2lid
+
+
+def save_lid_maps(lid2id: dict[str, int], id2lid: dict[int, str], output_dir: str | Path) -> Path:
+    output_path = Path(output_dir) / "lid_maps.json"
+    payload = {
+        "lid2id": lid2id,
+        "id2lid": {str(idx): lid for idx, lid in id2lid.items()},
+    }
+    output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return output_path
+
+
+def summarize_entity_language_bias(examples: Iterable[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    counts: dict[str, Counter[str]] = {}
+    for example in examples:
+        if not example.get("has_labels", True):
+            continue
+        for tag, lid_tag in zip(example["ner_tags"], example.get("lid_tags", [])):
+            if not tag.startswith("B-"):
+                continue
+            entity_type = tag[2:]
+            counts.setdefault(entity_type, Counter())
+            counts[entity_type][lid_tag] += 1
+
+    summary: dict[str, dict[str, Any]] = {}
+    for entity_type, counter in sorted(counts.items()):
+        total = sum(counter.values())
+        summary[entity_type] = {
+            "counts": dict(sorted(counter.items())),
+            "distribution": {
+                lid_tag: round(count / total, 4) for lid_tag, count in sorted(counter.items())
+            },
+            "dominant_language": counter.most_common(1)[0][0] if counter else None,
+        }
+    return summary
+
+
 class TokenizedNERDataset(Dataset):
     def __init__(
         self,
         examples: list[dict[str, Any]],
         tokenizer: PreTrainedTokenizerBase,
         label2id: dict[str, int],
+        lid2id: dict[str, int],
         max_length: int,
         label_all_tokens: bool = False,
     ) -> None:
@@ -180,6 +253,8 @@ class TokenizedNERDataset(Dataset):
         self.examples = examples
         self.tokenizer = tokenizer
         self.label2id = label2id
+        self.lid2id = lid2id
+        self.lid_pad_id = lid2id["<pad>"]
         self.max_length = max_length
         self.label_all_tokens = label_all_tokens
         self.features: list[dict[str, Any]] = []
@@ -194,19 +269,23 @@ class TokenizedNERDataset(Dataset):
             )
             word_ids = encoding.word_ids()
             labels: list[int] = []
+            lid_ids: list[int] = []
             previous_word_id: int | None = None
 
             for word_id in word_ids:
                 if word_id is None:
                     labels.append(-100)
+                    lid_ids.append(self.lid_pad_id)
                 elif not example.get("has_labels", True):
                     labels.append(-100)
+                    lid_ids.append(self.lid2id[example["lid_tags"][word_id]])
                 else:
                     gold_label = example["ner_tags"][word_id]
                     if word_id != previous_word_id or label_all_tokens:
                         labels.append(label2id[gold_label])
                     else:
                         labels.append(-100)
+                    lid_ids.append(self.lid2id[example["lid_tags"][word_id]])
                 previous_word_id = word_id
 
             self.features.append(
@@ -214,8 +293,11 @@ class TokenizedNERDataset(Dataset):
                     "input_ids": torch.tensor(encoding["input_ids"], dtype=torch.long),
                     "attention_mask": torch.tensor(encoding["attention_mask"], dtype=torch.long),
                     "labels": torch.tensor(labels, dtype=torch.long),
+                    "lid_ids": torch.tensor(lid_ids, dtype=torch.long),
                     "tokens": example["tokens"],
                     "gold_labels": example["ner_tags"],
+                    "lid_tags": example["lid_tags"],
+                    "lid_pad_id": self.lid_pad_id,
                     "word_ids": list(word_ids),
                     "example_id": example["id"],
                     "split": example["split"],
@@ -243,17 +325,23 @@ def create_data_collator(tokenizer: PreTrainedTokenizerBase) -> Callable[[list[d
         max_length = batch["input_ids"].shape[1]
 
         padded_labels = []
+        padded_lid_ids = []
         padded_word_ids = []
         for feature in features:
             label_row = feature["labels"].tolist()
+            lid_row = feature["lid_ids"].tolist()
+            lid_pad_id = int(feature["lid_pad_id"])
             word_ids = list(feature["word_ids"])
             pad_size = max_length - len(label_row)
             padded_labels.append(label_row + ([-100] * pad_size))
+            padded_lid_ids.append(lid_row + ([lid_pad_id] * pad_size))
             padded_word_ids.append(word_ids + ([None] * pad_size))
 
         batch["labels"] = torch.tensor(padded_labels, dtype=torch.long)
+        batch["lid_ids"] = torch.tensor(padded_lid_ids, dtype=torch.long)
         batch["tokens"] = [feature["tokens"] for feature in features]
         batch["gold_labels"] = [feature["gold_labels"] for feature in features]
+        batch["lid_tags"] = [feature["lid_tags"] for feature in features]
         batch["word_ids"] = padded_word_ids
         batch["example_ids"] = [feature["example_id"] for feature in features]
         batch["splits"] = [feature["split"] for feature in features]
@@ -291,11 +379,13 @@ def summarize_examples(examples: Iterable[dict[str, Any]]) -> dict[str, Any]:
     examples = list(examples)
     label_counter: Counter[str] = Counter()
     entity_counter: Counter[str] = Counter()
+    language_counter: Counter[str] = Counter()
     lengths: list[int] = []
     labeled_examples = 0
 
     for example in examples:
         lengths.append(len(example["tokens"]))
+        language_counter.update(example.get("lid_tags", []))
         if example.get("has_labels", True):
             labeled_examples += 1
             label_counter.update(example["ner_tags"])
@@ -310,4 +400,5 @@ def summarize_examples(examples: Iterable[dict[str, Any]]) -> dict[str, Any]:
         "max_tokens_per_example": max_length,
         "label_distribution": dict(sorted(label_counter.items())),
         "entity_type_counts": dict(sorted(entity_counter.items())),
+        "language_distribution": dict(sorted(language_counter.items())),
     }

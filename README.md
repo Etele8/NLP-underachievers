@@ -336,6 +336,13 @@ uv run python -m src.train --config configs/mbert.yaml
 uv run python -m src.train --config configs/xlmr.yaml
 ```
 
+### Train Language-Bias Variants
+
+```powershell
+uv run python -m src.train --config configs/mbert_language_bias.yaml
+uv run python -m src.train --config configs/xlmr_language_bias.yaml
+```
+
 ### Smoke Test
 
 ```powershell
@@ -355,6 +362,17 @@ uv run python -m src.predict --config configs/mbert.yaml --checkpoint outputs/re
 ```
 
 If the selected split has usable gold labels, prediction also writes metrics and a classification report. The current `test` CSV appears to contain masked blank labels, so the pipeline saves predictions and skips seqeval metrics for that split.
+
+### Entity-Type Language Bias Module
+
+The workflow now supports an optional entity-type-specific language bias head on top of the multilingual encoder:
+
+- token-level `lid` labels are parsed from the CSV and aligned to subwords
+- the classifier can learn an entity-type-by-language bias table
+- an optional soft gate combines hidden states with a language embedding before adjusting the label logits
+- training exports `train_entity_language_bias.json` and `validation_entity_language_bias.json` so you can inspect which entity types skew toward which language IDs
+
+Use the baseline configs (`configs/mbert.yaml`, `configs/xlmr.yaml`) for standard fine-tuning and the language-bias configs (`configs/mbert_language_bias.yaml`, `configs/xlmr_language_bias.yaml`) for the new architecture.
 
 ### SLURM Commands
 

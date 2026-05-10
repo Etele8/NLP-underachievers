@@ -14,6 +14,7 @@ PROJECT_DIR="${PROJECT_DIR:-$HOME/projects/NLP-underachievers}"
 cd "$PROJECT_DIR"
 
 CONFIG=${CONFIG:-configs/mbert.yaml}
+EXTRA_ARGS=${EXTRA_ARGS:-}
 
 mkdir -p outputs/slurm_logs
 
@@ -39,4 +40,4 @@ print("cuda_available:", torch.cuda.is_available())
 print("cuda_device_count:", torch.cuda.device_count())
 PY
 
-.venv/bin/python -m src.train --config "$CONFIG"
+.venv/bin/python -m src.train --config "$CONFIG" $EXTRA_ARGS

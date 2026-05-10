@@ -21,6 +21,8 @@ BASELINE_CONFIG = {
     "epochs": 5,
     "weight_decay": 0.01,
     "max_seq_length": 128,
+    "language_bias": False,
+    "use_lid_feature": False,
 }
 
 OUTPUT_ROOT = PROJECT_ROOT / "outputs"
@@ -46,6 +48,8 @@ TRACKED_PARAMETERS = (
     "epochs",
     "weight_decay",
     "max_seq_length",
+    "language_bias",
+    "use_lid_feature",
     "lora",
 )
 
@@ -56,6 +60,8 @@ PARAMETER_GROUPS = {
     "epochs": "epochs",
     "weight_decay": "weight_decay",
     "max_seq_length": "max_seq_length",
+    "language_bias": "language_bias",
+    "use_lid_feature": "lid_feature",
     "lora": "lora",
 }
 
@@ -66,6 +72,8 @@ PARAMETER_PREFIXES = {
     "epochs": "ep",
     "weight_decay": "wd",
     "max_seq_length": "seq",
+    "language_bias": "langbias",
+    "use_lid_feature": "lidfeat",
     "lora": "lora",
 }
 
@@ -84,6 +92,8 @@ def _parameter_token(key: str, value: Any, *, compact: bool = False) -> str:
     """Create the path token for one changed parameter."""
     if key == "lora":
         return "lora" if bool(value) else "full"
+    if key in {"language_bias", "use_lid_feature"}:
+        return PARAMETER_PREFIXES[key] if bool(value) else f"no{PARAMETER_PREFIXES[key]}"
     if compact and key in {"batch_size", "epochs", "weight_decay", "max_seq_length"}:
         return f"{PARAMETER_PREFIXES[key]}{_format_value(value)}"
     return f"{PARAMETER_PREFIXES[key]}_{_format_value(value)}"
@@ -257,6 +267,8 @@ def _build_training_config(
             "num_workers": int(os.environ.get("SLURM_CPUS_PER_TASK", "0")),
             "resume_from_checkpoint": True,
             "experiment": config,
+            "use_language_bias": bool(config.get("language_bias", False)),
+            "use_lid_feature": bool(config.get("use_lid_feature", False)),
         }
     )
     for key in ("train_path", "validation_path", "test_path"):

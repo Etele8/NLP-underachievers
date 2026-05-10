@@ -34,6 +34,7 @@ def save_predictions_table(
                 "split": example["split"],
                 "row_id": example["id"],
                 "tokens": example["tokens"],
+                "lid_tags": example.get("lid_tags", []),
                 "gold_labels": gold,
                 "pred_labels": pred,
             }
@@ -46,7 +47,7 @@ def save_predictions_table(
         return
 
     with path_obj.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=["split", "row_id", "tokens", "gold_labels", "pred_labels"])
+        writer = csv.DictWriter(handle, fieldnames=["split", "row_id", "tokens", "lid_tags", "gold_labels", "pred_labels"])
         writer.writeheader()
         for record in records:
             writer.writerow(
@@ -54,6 +55,7 @@ def save_predictions_table(
                     "split": record["split"],
                     "row_id": record["row_id"],
                     "tokens": json.dumps(record["tokens"], ensure_ascii=False),
+                    "lid_tags": json.dumps(record["lid_tags"], ensure_ascii=False),
                     "gold_labels": json.dumps(record["gold_labels"], ensure_ascii=False),
                     "pred_labels": json.dumps(record["pred_labels"], ensure_ascii=False),
                 }

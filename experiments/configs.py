@@ -16,6 +16,8 @@ BASELINE_HYPERPARAMETERS = {
     "batch_size": 8,
     "weight_decay": 0.01,
     "max_seq_length": 128,
+    "language_bias": False,
+    "use_lid_feature": False,
 }
 
 SWEEP_VALUES = {
@@ -50,6 +52,10 @@ def generate_experiment_name(config: dict) -> str:
     )
     if bool(config.get("lora", False)):
         name += "_lora"
+    if bool(config.get("language_bias", False)):
+        name += "_langbias"
+    if bool(config.get("use_lid_feature", False)):
+        name += "_lidfeat"
     return name
 
 
@@ -73,6 +79,13 @@ def _single_parameter_variants(baseline: dict) -> list[dict]:
     return variants
 
 
+def _language_bias_variant(baseline: dict) -> dict:
+    experiment = dict(baseline)
+    experiment["language_bias"] = True
+    experiment["use_lid_feature"] = True
+    return experiment
+
+
 def generate_full_experiment_sweep(
     max_experiments: int | None = None,
 ) -> list[dict]:
@@ -85,6 +98,7 @@ def generate_full_experiment_sweep(
     for model in MODELS:
         baseline = _baseline_for_model(model)
         sweep.append(baseline)
+        sweep.append(_language_bias_variant(baseline))
         sweep.extend(_single_parameter_variants(baseline))
 
     if max_experiments is None:

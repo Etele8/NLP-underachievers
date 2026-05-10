@@ -1,5 +1,5 @@
 model_name: "FacebookAI/xlm-roberta-base"
-run_name: "xlmr_full_ft"
+run_name: "xlmr_language_bias"
 train_path: "data/raw/ner_spaeng_train.csv"
 validation_path: "data/raw/ner_spaeng_validation.csv"
 test_path: "data/raw/ner_spaeng_test.csv"
@@ -17,7 +17,7 @@ gradient_clip_norm: 1.0
 dropout: null
 num_workers: 0
 save_best_metric: "f1"
-use_language_bias: false
-use_lid_feature: false
+use_language_bias: true
+use_lid_feature: true
 language_embedding_dim: 32
 language_gate_hidden_dim: 128

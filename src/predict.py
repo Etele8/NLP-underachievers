@@ -40,19 +40,27 @@ def main() -> None:
     checkpoint_path = Path(args.checkpoint)
     run_output_dir = ensure_dir(checkpoint_path.parent)
 
-    _, examples = _select_split(config, args.split)
-
-    tokenizer, resolved_tokenizer_name = load_tokenizer(config["model_name"])
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    effective_config = dict(config)
+    effective_config.update(checkpoint.get("config", {}))
+    _, examples = _select_split(effective_config, args.split)
+
+    tokenizer, resolved_tokenizer_name = load_tokenizer(effective_config["model_name"])
     label2id = checkpoint["label2id"]
     id2label = {int(idx): label for idx, label in checkpoint["id2label"].items()}
+    lid2id = checkpoint.get("lid2id") or {"<pad>": 0}
 
     model, resolved_model_name = create_token_classifier(
-        config["model_name"],
+        effective_config["model_name"],
         num_labels=len(label2id),
         label2id=label2id,
         id2label=id2label,
-        dropout=config.get("dropout"),
+        lid2id=lid2id,
+        dropout=effective_config.get("dropout"),
+        use_language_bias=bool(effective_config.get("use_language_bias", False)),
+        use_lid_feature=bool(effective_config.get("use_lid_feature", False)),
+        language_embedding_dim=int(effective_config.get("language_embedding_dim", 32)),
+        language_gate_hidden_dim=int(effective_config.get("language_gate_hidden_dim", 128)),
     )
     load_checkpoint(checkpoint_path, model)
 
@@ -60,14 +68,15 @@ def main() -> None:
         examples,
         tokenizer,
         label2id=label2id,
-        max_length=int(config["max_length"]),
-        label_all_tokens=bool(config["label_all_tokens"]),
+        lid2id=lid2id,
+        max_length=int(effective_config["max_length"]),
+        label_all_tokens=bool(effective_config["label_all_tokens"]),
     )
     dataloader = DataLoader(
         dataset,
-        batch_size=int(config["eval_batch_size"]),
+        batch_size=int(effective_config["eval_batch_size"]),
         shuffle=False,
-        num_workers=int(config.get("num_workers", 0)),
+        num_workers=int(effective_config.get("num_workers", 0)),
         collate_fn=create_data_collator(tokenizer),
         pin_memory=torch.cuda.is_available(),
     )

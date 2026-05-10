@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import random
-import shutil
 from pathlib import Path
 from typing import Any
 
@@ -64,6 +63,8 @@ def save_checkpoint(
     config: dict[str, Any],
     label2id: dict[str, int],
     id2label: dict[int, str],
+    lid2id: dict[str, int] | None = None,
+    id2lid: dict[int, str] | None = None,
 ) -> Path:
     checkpoint = {
         "epoch": epoch,
@@ -71,6 +72,8 @@ def save_checkpoint(
         "config": config,
         "label2id": label2id,
         "id2label": {int(idx): label for idx, label in id2label.items()},
+        "lid2id": lid2id or {},
+        "id2lid": {int(idx): lid for idx, lid in (id2lid or {}).items()},
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
