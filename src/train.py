@@ -27,6 +27,7 @@ from .utils import (
     count_trainable_parameters,
     ensure_dir,
     get_device,
+    load_checkpoint,
     load_yaml_config,
     save_checkpoint,
     save_config_copy,
@@ -191,6 +192,13 @@ def _write_metrics_jsonl(path: Path, payload: dict[str, Any]) -> None:
         handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
+def _move_optimizer_state_to_device(optimizer: torch.optim.Optimizer, device: torch.device) -> None:
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if isinstance(value, torch.Tensor):
+                state[key] = value.to(device)
+
+
 def _prepare_run_dir(config: dict[str, Any]) -> Path:
     if "run_dir" in config:
         return ensure_dir(config["run_dir"])
@@ -299,8 +307,33 @@ def train(config: dict[str, Any], smoke_test: bool = False) -> dict[str, Any]:
     best_metric = float("-inf")
     epochs = int(config["epochs"])
     latest_summary: dict[str, Any] | None = None
+    start_epoch = 1
+    resume_checkpoint = output_dir / "last.pt"
+    if bool(config.get("resume_from_checkpoint", True)) and resume_checkpoint.exists():
+        checkpoint = load_checkpoint(resume_checkpoint, model, optimizer, scheduler)
+        _move_optimizer_state_to_device(optimizer, device)
+        completed_epoch = int(checkpoint["epoch"])
+        best_metric = float(checkpoint["best_metric"])
+        start_epoch = completed_epoch + 1
+        LOGGER.info("Resuming from %s after epoch %s", resume_checkpoint, completed_epoch)
 
-    for epoch in range(1, epochs + 1):
+    if start_epoch > epochs:
+        LOGGER.info("Checkpoint already completed %s/%s epochs; nothing to train", epochs, epochs)
+        run_summary_path = output_dir / "run_summary.json"
+        if run_summary_path.exists():
+            return json.loads(run_summary_path.read_text(encoding="utf-8"))
+        return {
+            "best_metric_name": best_metric_name,
+            "best_metric_value": best_metric,
+            "last_epoch_metrics": {},
+            "resolved_model_name": resolved_model_name,
+            "resolved_tokenizer_name": resolved_tokenizer_name,
+            "output_dir": str(output_dir),
+            "best_checkpoint": str(output_dir / "best.pt"),
+            "last_checkpoint": str(output_dir / "last.pt"),
+        }
+
+    for epoch in range(start_epoch, epochs + 1):
         train_loss = train_one_epoch(
             model,
             train_loader,
